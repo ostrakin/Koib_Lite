@@ -1,5 +1,5 @@
 # Koib-V-4.6 — Production-ready RAG (2GB RAM optimized)
-# ★ ИСПРАВЛЕНО: rank_bm25 удалён — заменён на SQLite FTS5 (zero-RAM sparse search)
+# ★ Sparse search реализован через SQLite FTS5 (встроен в Python, zero-RAM)
 
 # PDF Parsing
 PyMuPDF>=1.23.8
