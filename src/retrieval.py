@@ -27,6 +27,9 @@ from config import (
 logger = logging.getLogger("koib.retrieval")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Семантическое кэширование (SQLite)
+# ═══════════════════════════════════════════════════════════════
 class SemanticCache:
     """Семантическое кэширование через SQLite."""
 
@@ -108,7 +111,6 @@ class SemanticCache:
         except Exception as exc:
             logger.debug(f"Semantic cache set error: {exc}")
 
-    # ★ НОВОЕ: очистка кэша (для тестов и будущей ротации)
     def clear(self) -> None:
         """Полностью очистить семантический кэш."""
         try:
@@ -140,6 +142,9 @@ class SemanticCache:
             return 0
 
 
+# ═══════════════════════════════════════════════════════════════
+# HyDE-кэш (SQLite)
+# ═══════════════════════════════════════════════════════════════
 class ResponseCache:
     """HyDE-кэш."""
 
@@ -173,7 +178,6 @@ class ResponseCache:
                 (self._hash(query), hypothetical),
             )
 
-    # ★ НОВОЕ: очистка кэша (нужно для теста test_cache_clear)
     def clear(self) -> None:
         """Полностью очистить HyDE-кэш."""
         try:
@@ -183,6 +187,9 @@ class ResponseCache:
             logger.debug(f"ResponseCache clear error: {exc}")
 
 
+# ═══════════════════════════════════════════════════════════════
+# Структура результата поиска
+# ═══════════════════════════════════════════════════════════════
 @dataclass
 class RetrievalResult:
     chunk_id: str
@@ -216,6 +223,9 @@ class RetrievalResult:
         return "\n".join(parts)
 
 
+# ═══════════════════════════════════════════════════════════════
+# Определение интента запроса
+# ═══════════════════════════════════════════════════════════════
 TABLE_KEYWORDS = {"таблиц", "значени", "параметр", "сводк", "данные", "показател"}
 FORMULA_KEYWORDS = {"формул", "вычислен", "расчёт", "уравнен", "коэффициент"}
 FIGURE_KEYWORDS = {"схем", "рисунок", "диаграмм", "чертёж", "график"}
@@ -236,6 +246,9 @@ def _detect_query_intent(query: str) -> Dict[str, float]:
     return intent
 
 
+# ═══════════════════════════════════════════════════════════════
+# Гибридный ретривер (Dense + Sparse + Reranker)
+# ═══════════════════════════════════════════════════════════════
 class HybridRetriever:
     def __init__(self, index_builder: Optional[IndexBuilder] = None):
         self.index_builder = index_builder or IndexBuilder()
