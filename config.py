@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.6 — Конфигурация (оптимизировано для 2 ГБ RAM, production-ready)
+★ ИСПРАВЛЕНО: OCR_DPI снижен до 200 (экономия ~50% RAM при парсинге)
 """
 import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
+
 DOCS_DIR = Path(os.getenv("KOIB_DOCS_DIR", str(DATA_DIR / "docs")))
 OUTPUT_DIR = Path(os.getenv("KOIB_OUTPUT_DIR", str(BASE_DIR / "output")))
-
 INDEX_DIR = OUTPUT_DIR / "index"
 DOCSTORE_DIR = OUTPUT_DIR / "docstore"
 FIGURES_DIR = OUTPUT_DIR / "figures"
@@ -18,11 +19,9 @@ METADATA_DIR = OUTPUT_DIR / "metadata"
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gigachat")
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
-
-LOCAL_EMBEDDING_MODEL = os.getenv(
-    "LOCAL_EMBEDDING_MODEL", "intfloat/multilingual-e5-small"
-)
+LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "intfloat/multilingual-e5-small")
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+
 PASSAGE_PREFIX = "passage: "
 QUERY_PREFIX = "query: "
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -31,7 +30,6 @@ TEXT_CHUNK_SIZE = int(os.getenv("TEXT_CHUNK_SIZE", "800"))
 TEXT_CHUNK_OVERLAP = int(os.getenv("TEXT_CHUNK_OVERLAP", "80"))
 MIN_CHUNK_LENGTH = int(os.getenv("MIN_CHUNK_LENGTH", "50"))
 
-# ★ ИСПРАВЛЕНО: Top-K=4 (компромисс между V-4.3=5 и V-4.5=3)
 VECTOR_SEARCH_K = int(os.getenv("VECTOR_SEARCH_K", "15"))
 BM25_SEARCH_K = int(os.getenv("BM25_SEARCH_K", "10"))
 FINAL_TOP_K = int(os.getenv("FINAL_TOP_K", "4"))
@@ -40,14 +38,12 @@ HYBRID_ALPHA = float(os.getenv("HYBRID_ALPHA", "0.6"))
 USE_RERANKER = os.getenv("USE_RERANKER", "true").lower() == "true"
 RERANKER_MODEL = os.getenv("RERANKER_MODEL", "DiTy/ru-reranker-base")
 USE_ONNX_RERANKER = os.getenv("USE_ONNX_RERANKER", "true").lower() == "true"
-
 USE_HYDE = os.getenv("USE_HYDE", "false").lower() == "true"
 BM25_USE_STOPWORDS = os.getenv("BM25_USE_STOPWORDS", "true").lower() == "true"
 
 GIGACHAT_CREDENTIALS = os.getenv("GIGACHAT_CREDENTIALS", "")
 GIGACHAT_MODEL = os.getenv("GIGACHAT_MODEL", "GigaChat")
 GIGACHAT_TEMPERATURE = float(os.getenv("GIGACHAT_TEMPERATURE", "0.2"))
-# ★ ИСПРАВЛЕНО: 1536 токенов достаточно для таблиц
 GIGACHAT_MAX_TOKENS = int(os.getenv("GIGACHAT_MAX_TOKENS", "1536"))
 GIGACHAT_TIMEOUT = int(os.getenv("GIGACHAT_TIMEOUT", "45"))
 GIGACHAT_VERIFY_SSL = os.getenv("GIGACHAT_VERIFY_SSL", "false").lower() == "true"
@@ -62,7 +58,8 @@ LOCAL_LLM_URL = os.getenv("LOCAL_LLM_URL", "http://localhost:11434")
 VALIDATION_IGNORE_QUOTES = os.getenv("VALIDATION_IGNORE_QUOTES", "true").lower() == "true"
 UNCERTAINTY_MIN_LENGTH = int(os.getenv("UNCERTAINTY_MIN_LENGTH", "50"))
 
-OCR_DPI = int(os.getenv("OCR_DPI", "300"))
+# ★ ИСПРАВЛЕНО: 200 DPI достаточно для Tesseract, экономит ~50% RAM vs 300 DPI
+OCR_DPI = int(os.getenv("OCR_DPI", "200"))
 OCR_MIN_TEXT_CHARS = int(os.getenv("OCR_MIN_TEXT_CHARS", "50"))
 MIN_IMAGE_WIDTH = int(os.getenv("MIN_IMAGE_WIDTH", "80"))
 MIN_IMAGE_HEIGHT = int(os.getenv("MIN_IMAGE_HEIGHT", "80"))
@@ -75,9 +72,12 @@ VK_CONFIRM_CODE = os.getenv("VK_CONFIRM_CODE", "12345678")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
 VK_ACCESS_TOKEN = os.getenv("VK_ACCESS_TOKEN", "")
 
-# ★ НОВОЕ: Семантический кэш
 SEMANTIC_CACHE_ENABLED = os.getenv("SEMANTIC_CACHE_ENABLED", "true").lower() == "true"
 SEMANTIC_CACHE_THRESHOLD = float(os.getenv("SEMANTIC_CACHE_THRESHOLD", "0.92"))
+
+# ★ НОВОЕ: жёсткий лимит одновременных генераций (защита от OOM-спайков)
+MAX_CONCURRENT_GENERATIONS = int(os.getenv("MAX_CONCURRENT_GENERATIONS", "2"))
+
 
 def get_device() -> str:
     try:
@@ -85,6 +85,7 @@ def get_device() -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
     except ImportError:
         return "cpu"
+
 
 def ensure_dirs() -> None:
     for d in [DOCS_DIR, OUTPUT_DIR, INDEX_DIR, DOCSTORE_DIR,

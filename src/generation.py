@@ -1,26 +1,27 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.6 — Модуль генерации ответов
-★ ПОЛНОСТЬЮ АСИНХРОННЫЙ (aiohttp) для работы в FastAPI event loop
-★ ВОЗВРАЩЁН полный SYSTEM_PROMPT с правилами LaTeX/таблиц/схем
-★ Интегрирован JSONL QueryLogger
+★ ИСПРАВЛЕНО: asyncio.Semaphore ограничивает параллельные генерации
+  (защита от OOM при одновременных запросах от VK-бота)
+★ Полностью асинхронный (aiohttp)
 """
 import logging
 from typing import List, Dict, Any, Optional
 import aiohttp
 import asyncio
-import urllib3
+import ssl
+
 from .retrieval import RetrievalResult
 from config import (
     LLM_PROVIDER, GIGACHAT_CREDENTIALS, GIGACHAT_MODEL,
     GIGACHAT_TEMPERATURE, GIGACHAT_MAX_TOKENS, GIGACHAT_TIMEOUT,
     GIGACHAT_VERIFY_SSL, OPENAI_API_KEY, OPENAI_LLM_MODEL,
     OPENAI_TEMPERATURE, OPENAI_MAX_TOKENS, LOCAL_LLM_MODEL, LOCAL_LLM_URL,
+    MAX_CONCURRENT_GENERATIONS,
 )
 
 logger = logging.getLogger("koib.generation")
 
-# ★ ВОЗВРАЩЁН полный SYSTEM_PROMPT из V-4.3
 SYSTEM_PROMPT = """Ты — эксперт-ассистент по технической документации. Твоя задача — отвечать на вопросы пользователя строго на основе предоставленного контекста из документации.
 
 ПРАВИЛА ОТВЕТА:
@@ -50,11 +51,7 @@ def build_prompt(query: str, results: List[RetrievalResult]) -> str:
 
 
 class LLMClient:
-    """
-    ★ ПОЛНОСТЬЮ АСИНХРОННЫЙ клиент LLM.
-    Использует aiohttp для всех HTTP-запросов.
-    Не блокирует FastAPI event loop.
-    """
+    """Полностью асинхронный клиент LLM."""
 
     def __init__(self, provider: Optional[str] = None):
         self.provider = provider or LLM_PROVIDER
@@ -62,8 +59,6 @@ class LLMClient:
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            # Отключаем SSL-верификацию для GigaChat при необходимости
-            import ssl
             ssl_ctx = None
             if not GIGACHAT_VERIFY_SSL and self.provider == "gigachat":
                 ssl_ctx = ssl.create_default_context()
@@ -92,7 +87,7 @@ class LLMClient:
     def generate(self, prompt: str, system_prompt: Optional[str] = None,
                  max_tokens: int = GIGACHAT_MAX_TOKENS,
                  temperature: float = GIGACHAT_TEMPERATURE) -> str:
-        """Синхронная обёртка для обратной совместимости."""
+        """Синхронная обёртка."""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
@@ -113,16 +108,13 @@ class LLMClient:
     ) -> str:
         if not GIGACHAT_CREDENTIALS:
             return "Ошибка: GIGACHAT_CREDENTIALS не заданы."
-
         session = await self._get_session()
         auth_headers = {
             "Authorization": f"Basic {GIGACHAT_CREDENTIALS}",
             "RqUID": "koib-rag-001",
             "Content-Type": "application/x-www-form-urlencoded",
         }
-
         try:
-            # Авторизация
             async with session.post(
                 "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
                 headers=auth_headers,
@@ -134,7 +126,6 @@ class LLMClient:
                 auth_data = await auth_resp.json()
                 token = auth_data["access_token"]
 
-            # Генерация
             chat_headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -155,7 +146,6 @@ class LLMClient:
                 timeout=aiohttp.ClientTimeout(total=GIGACHAT_TIMEOUT),
             ) as chat_resp:
                 if chat_resp.status == 401:
-                    # Обновляем токен и повторяем
                     async with session.post(
                         "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
                         headers=auth_headers,
@@ -181,7 +171,6 @@ class LLMClient:
                     return f"Ошибка API GigaChat: {chat_resp.status}"
                 chat_data = await chat_resp.json()
                 return chat_data["choices"][0]["message"]["content"].strip()
-
         except asyncio.TimeoutError:
             return "Таймаут запроса к GigaChat."
         except aiohttp.ClientError as e:
@@ -234,12 +223,15 @@ class LLMClient:
 class AnswerGenerator:
     """
     Полный RAG-пайплайн: поиск → промпт → LLM → валидация → лог.
+    ★ Semaphore ограничивает параллельные генерации, предотвращая OOM.
     """
 
     def __init__(self):
         from .retrieval import HybridRetriever
         self.retriever = HybridRetriever()
         self.llm = LLMClient()
+        # ★ КРИТИЧНО: жёсткий лимит параллельных генераций
+        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
 
     async def answer_async(
         self,
@@ -249,68 +241,70 @@ class AnswerGenerator:
         validate: bool = True,
     ) -> Dict[str, Any]:
         import time
-        t0 = time.time()
+        # ★ Семафор: если лимит исчерпан, запрос ждёт в очереди (без OOM-спайка)
+        async with self._semaphore:
+            t0 = time.time()
+            results = self.retriever.search(query, k=k, model_filter=model_filter)
 
-        results = self.retriever.search(query, k=k, model_filter=model_filter)
-        if not results:
+            if not results:
+                answer_result = {
+                    "answer": "По вашему запросу не найдено релевантных фрагментов в документации.",
+                    "sources": [],
+                    "results": [],
+                    "context_text": "",
+                    "validation": None,
+                    "status": "review",
+                }
+                self._log_query(query, answer_result, model_filter)
+                return answer_result
+
+            prompt = build_prompt(query, results)
+            answer = await self.llm.generate_async(prompt)
+
+            validation_result = None
+            if validate:
+                try:
+                    from .validation import AnswerValidator
+                    validator = AnswerValidator()
+                    validation_result = validator.validate(answer, results, query)
+                    validation_dict = validation_result.to_dict()
+                except Exception as exc:
+                    logger.warning(f"Ошибка валидации: {exc}")
+                    validation_dict = None
+            else:
+                validation_dict = None
+
+            sources = [
+                {"document": r.source, "page": r.page, "heading": r.heading,
+                 "chunk_type": r.chunk_type, "score": r.score}
+                for r in results
+            ]
+
+            status = "approved"
+            final_answer = answer
+            if validation_dict:
+                if validation_dict.get("status") == "rejected":
+                    status = "rejected"
+                    final_answer = "По вашему запросу не найдено точного ответа в официальных источниках."
+                elif validation_dict.get("status") == "review":
+                    status = "review"
+
             answer_result = {
-                "answer": "По вашему запросу не найдено релевантных фрагментов в документации.",
-                "sources": [],
-                "results": [],
-                "context_text": "",
-                "validation": None,
-                "status": "review",
+                "answer": final_answer,
+                "sources": sources,
+                "results": results,
+                "context_text": prompt,
+                "validation": validation_dict,
+                "status": status,
+                "latency": time.time() - t0,
             }
             self._log_query(query, answer_result, model_filter)
+            logger.info(f"Ответ сгенерирован за {answer_result['latency']:.2f}с")
             return answer_result
-
-        prompt = build_prompt(query, results)
-        answer = await self.llm.generate_async(prompt)
-
-        validation_result = None
-        if validate:
-            try:
-                from .validation import AnswerValidator
-                validator = AnswerValidator()
-                validation_result = validator.validate(answer, results, query)
-                validation_dict = validation_result.to_dict()
-            except Exception as exc:
-                logger.warning(f"Ошибка валидации: {exc}")
-                validation_dict = None
-        else:
-            validation_dict = None
-
-        sources = [
-            {"document": r.source, "page": r.page, "heading": r.heading,
-             "chunk_type": r.chunk_type, "score": r.score}
-            for r in results
-        ]
-
-        status = "approved"
-        final_answer = answer
-        if validation_dict:
-            if validation_dict.get("status") == "rejected":
-                status = "rejected"
-                final_answer = "По вашему запросу не найдено точного ответа в официальных источниках."
-            elif validation_dict.get("status") == "review":
-                status = "review"
-
-        answer_result = {
-            "answer": final_answer,
-            "sources": sources,
-            "results": results,
-            "context_text": prompt,
-            "validation": validation_dict,
-            "status": status,
-            "latency": time.time() - t0,
-        }
-        self._log_query(query, answer_result, model_filter)
-        logger.info(f"Ответ сгенерирован за {answer_result['latency']:.2f}с")
-        return answer_result
 
     def answer(self, query: str, k: int = 4, model_filter: str = "",
                validate: bool = True) -> Dict[str, Any]:
-        """Синхронная обёртка для CLI и совместимости."""
+        """Синхронная обёртка для CLI."""
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():

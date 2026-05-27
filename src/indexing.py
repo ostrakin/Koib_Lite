@@ -1,330 +1,412 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.6 — Модуль индексации
-★ ИСПРАВЛЕНО: квантизация применяется к auto_model (стабильно)
-★ SQLite DocStore вместо JSON (экономия RAM)
+★ КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: BM25 на SQLite FTS5 (zero-RAM sparse search)
+  Вместо загрузки корпуса в rank_bm25 (~300-500 МБ RAM на 1000+ страниц)
+  используем SQLite FTS5, который работает с диска без загрузки в память.
+★ DocStore выгружен в SQLite (full_content таблиц/формул).
+★ Синглтон эмбеддингов с ленивой инициализацией.
 """
 import json
-import pickle
-import logging
+import re
 import sqlite3
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-from .chunking import Chunk
+from dataclasses import asdict
+
+import numpy as np
+
 from config import (
     INDEX_DIR, DOCSTORE_DIR, METADATA_DIR,
-    LOCAL_EMBEDDING_MODEL, EMBEDDING_PROVIDER, OPENAI_API_KEY,
-    OPENAI_EMBEDDING_MODEL, PASSAGE_PREFIX,
-    BM25_USE_STOPWORDS, get_device, ensure_dirs,
+    EMBEDDING_PROVIDER, LOCAL_EMBEDDING_MODEL, OPENAI_EMBEDDING_MODEL,
+    OPENAI_API_KEY, BM25_USE_STOPWORDS, PASSAGE_PREFIX,
 )
 
 logger = logging.getLogger("koib.indexing")
 
-RUSSIAN_STOPWORDS = {
-    "и", "в", "на", "с", "по", "для", "из", "к", "от", "о", "об",
-    "а", "но", "что", "как", "это", "не", "да", "нет", "бы", "ли",
-    "же", "при", "до", "за", "во", "со", "ко", "без", "над", "под",
-    "через", "между", "около", "у", "про", "после", "перед", "вместо",
-    "кроме", "среди", "вокруг", "вдоль", "поперёк",
-    "он", "она", "оно", "они", "мы", "вы", "я", "ты",
-    "его", "её", "их", "наш", "ваш", "свой",
-    "этот", "тот", "такой", "который", "какой", "чей",
-    "быть", "было", "будет", "есть", "были",
-    "все", "всё", "вся", "весь", "каждый", "любой",
-    "очень", "более", "менее", "также", "тоже",
-}
-
-
+# ═══════════════════════════════════════════════════════════════
+# Синглтон эмбеддингов (ленивая загрузка, экономия RAM)
+# ═══════════════════════════════════════════════════════════════
 _GLOBAL_EMBEDDINGS = None
 
 
 def get_global_embeddings():
-    """
-    ★ ИСПРАВЛЕНО: квантизация через auto_model (стабильно во всех версиях
-    sentence-transformers). Применение ко всему SentenceTransformer
-    могло приводить к падению encode().
-    """
+    """Ленивый синглтон модели эмбеддингов."""
     global _GLOBAL_EMBEDDINGS
     if _GLOBAL_EMBEDDINGS is not None:
         return _GLOBAL_EMBEDDINGS
 
-    device = get_device()
-    if EMBEDDING_PROVIDER == "openai" and OPENAI_API_KEY:
+    if EMBEDDING_PROVIDER == "local":
+        from langchain_huggingface import HuggingFaceEmbeddings
+        _GLOBAL_EMBEDDINGS = HuggingFaceEmbeddings(
+            model_name=LOCAL_EMBEDDING_MODEL,
+            model_kwargs={"device": "cpu"},
+            encode_kwargs={"normalize_embeddings": True},
+        )
+    elif EMBEDDING_PROVIDER == "openai":
         from langchain_openai import OpenAIEmbeddings
         _GLOBAL_EMBEDDINGS = OpenAIEmbeddings(
             model=OPENAI_EMBEDDING_MODEL,
             openai_api_key=OPENAI_API_KEY,
         )
-        logger.info("Загружены OpenAI эмбеддинги")
-        return _GLOBAL_EMBEDDINGS
+    else:
+        raise ValueError(f"Unknown EMBEDDING_PROVIDER: {EMBEDDING_PROVIDER}")
 
-    from langchain_huggingface import HuggingFaceEmbeddings
-    import torch
-
-    logger.info(f"Загрузка и CPU-квантизация {LOCAL_EMBEDDING_MODEL}...")
-    hf_embeddings = HuggingFaceEmbeddings(
-        model_name=LOCAL_EMBEDDING_MODEL,
-        encode_kwargs={"normalize_embeddings": True},
-        model_kwargs={"device": device},
-    )
-
-    # ★ ИСПРАВЛЕНО: квантизуем только внутреннюю языковую модель
-    try:
-        auto_model = hf_embeddings.client[0].auto_model
-        hf_embeddings.client[0].auto_model = torch.quantization.quantize_dynamic(
-            auto_model,
-            {torch.nn.Linear},
-            dtype=torch.qint8,
-        )
-        logger.info(f"Модель {LOCAL_EMBEDDING_MODEL} квантизована (int8, auto_model)")
-    except Exception as exc:
-        logger.warning(f"Квантизация не удалась: {exc}. Используем FP32.")
-
-    _GLOBAL_EMBEDDINGS = hf_embeddings
+    logger.info(f"Эмбеддинги загружены: {EMBEDDING_PROVIDER}")
     return _GLOBAL_EMBEDDINGS
 
 
-class SQLiteDocStore:
-    """SQLite-хранилище полного контента чанков."""
+# ═══════════════════════════════════════════════════════════════
+# Русская токенизация для FTS5
+# ═══════════════════════════════════════════════════════════════
+RU_STOPWORDS = {
+    "и", "в", "на", "с", "по", "для", "из", "к", "от", "о", "об", "а", "но",
+    "да", "не", "что", "как", "это", "то", "же", "бы", "вы", "мы", "он", "она",
+    "они", "оно", "я", "ты", "его", "её", "их", "мой", "твой", "наш", "ваш",
+    "свой", "этот", "тот", "такой", "который", "весь", "все", "вся", "всё",
+    "быть", "был", "была", "было", "были", "будет", "есть", "нет", "ещё", "уже",
+    "только", "если", "или", "при", "про", "за", "до", "после", "между",
+    "через", "над", "под", "перед", "так", "тоже", "лишь", "ведь", "вот",
+    "даже", "ну", "ли", "ни", "тебя", "мне", "мной", "ним", "ней", "нами",
+    "вам", "вас", "нас", "них", "чего", "чему", "чем", "кем", "ком", "где",
+    "когда", "зачем", "почему", "куда", "откуда", "какой", "какая", "какие",
+}
 
-    def __init__(self, path: Optional[Path] = None):
-        self.path = path or DOCSTORE_DIR / "docstore.db"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
+_TOKEN_RE = re.compile(r'[а-яёa-z0-9]+', re.IGNORECASE)
+
+
+def tokenize_ru(text: str) -> str:
+    """
+    Токенизация русского текста для FTS5.
+    Возвращает строку токенов через пробел.
+    """
+    if not text:
+        return ""
+    tokens = [t.lower() for t in _TOKEN_RE.findall(text) if len(t) > 1]
+    if BM25_USE_STOPWORDS:
+        tokens = [t for t in tokens if t not in RU_STOPWORDS]
+    return " ".join(tokens)
+
+
+def prepare_fts_query(query: str) -> str:
+    """
+    Готовит пользовательский запрос для FTS5 MATCH.
+    Токенизирует и соединяет через OR (широкий поиск).
+    Экранирует спецсимволы FTS5.
+    """
+    tokens = [t.lower() for t in _TOKEN_RE.findall(query) if len(t) > 1]
+    if BM25_USE_STOPWORDS:
+        tokens = [t for t in tokens if t not in RU_STOPWORDS]
+    if not tokens:
+        return ""
+    # OR-объединение для широкого recall
+    return " OR ".join(f'"{t}"' for t in tokens[:20])
+
+
+# ═══════════════════════════════════════════════════════════════
+# DocStore: SQLite хранилище full_content (таблицы/формулы/рисунки)
+# ═══════════════════════════════════════════════════════════════
+class DocStore:
+    """SQLite-хранилище полных версий структурированных чанков."""
+
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path or (DOCSTORE_DIR / "docstore.db")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self._init_db()
 
-    def _init_db(self) -> None:
+    def _init_db(self):
         with self.conn:
-            self.conn.execute('''
-                CREATE TABLE IF NOT EXISTS docs (
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS docstore (
                     chunk_id TEXT PRIMARY KEY,
-                    full_content TEXT,
-                    metadata TEXT,
-                    source TEXT
+                    content TEXT,
+                    chunk_type TEXT,
+                    metadata TEXT
                 )
-            ''')
-            self.conn.execute('CREATE INDEX IF NOT EXISTS idx_source ON docs(source)')
+            """)
 
-    def add(self, chunk_id: str, full_content: str, metadata: Dict[str, Any]) -> None:
-        with self.conn:
-            self.conn.execute(
-                'INSERT OR REPLACE INTO docs (chunk_id, full_content, metadata, source) '
-                'VALUES (?, ?, ?, ?)',
-                (chunk_id, full_content,
-                 json.dumps(metadata, ensure_ascii=False),
-                 metadata.get("source", "")),
-            )
+    def add(self, chunk) -> None:
+        if not chunk.full_content:
+            return
+        try:
+            with self.conn:
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO docstore "
+                    "(chunk_id, content, chunk_type, metadata) VALUES (?, ?, ?, ?)",
+                    (
+                        chunk.chunk_id,
+                        chunk.full_content,
+                        chunk.chunk_type,
+                        json.dumps(chunk.metadata, ensure_ascii=False),
+                    ),
+                )
+        except Exception as exc:
+            logger.debug(f"DocStore add error: {exc}")
+
+    def add_many(self, chunks) -> None:
+        rows = [
+            (c.chunk_id, c.full_content, c.chunk_type,
+             json.dumps(c.metadata, ensure_ascii=False))
+            for c in chunks if c.full_content
+        ]
+        if not rows:
+            return
+        try:
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO docstore "
+                    "(chunk_id, content, chunk_type, metadata) VALUES (?, ?, ?, ?)",
+                    rows,
+                )
+        except Exception as exc:
+            logger.warning(f"DocStore add_many error: {exc}")
 
     def get_content(self, chunk_id: str) -> Optional[str]:
         cur = self.conn.cursor()
-        cur.execute('SELECT full_content FROM docs WHERE chunk_id = ?', (chunk_id,))
+        cur.execute("SELECT content FROM docstore WHERE chunk_id = ?", (chunk_id,))
         row = cur.fetchone()
         return row[0] if row else None
 
-    def get_metadata(self, chunk_id: str) -> Optional[Dict[str, Any]]:
-        cur = self.conn.cursor()
-        cur.execute('SELECT metadata FROM docs WHERE chunk_id = ?', (chunk_id,))
-        row = cur.fetchone()
-        if row:
-            try:
-                return json.loads(row[0])
-            except json.JSONDecodeError:
-                return None
-        return None
 
-    @property
-    def size(self) -> int:
-        cur = self.conn.cursor()
-        cur.execute('SELECT COUNT(*) FROM docs')
-        return cur.fetchone()[0]
+# ═══════════════════════════════════════════════════════════════
+# BM25 через SQLite FTS5 (zero-RAM sparse search)
+# ═══════════════════════════════════════════════════════════════
+class BM25FTSIndex:
+    """
+    Sparse-индекс на SQLite FTS5.
+    Полностью заменяет rank_bm25: корпус НЕ загружается в RAM,
+    поиск идёт с диска через встроенный BM25-ранжировщик FTS5.
+    """
 
-    def remove_by_source(self, source: str) -> int:
+    def __init__(self, db_path: Optional[Path] = None):
+        self.db_path = db_path or (INDEX_DIR / "bm25_fts.db")
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        self._init_db()
+
+    def _init_db(self):
         with self.conn:
-            cur = self.conn.cursor()
-            cur.execute('DELETE FROM docs WHERE source = ?', (source,))
-            return cur.rowcount
+            self.conn.execute("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                    chunk_id UNINDEXED,
+                    content,
+                    chunk_type UNINDEXED,
+                    source UNINDEXED,
+                    page UNINDEXED,
+                    heading UNINDEXED,
+                    model UNINDEXED,
+                    metadata UNINDEXED,
+                    tokenize='unicode61 remove_diacritics 1'
+                )
+            """)
 
-    def close(self) -> None:
-        if self.conn:
-            self.conn.close()
+    def clear(self) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM chunks_fts")
 
-
-class BM25Index:
-    def __init__(self, path: Optional[Path] = None):
-        self.path = path or INDEX_DIR / "bm25_index.pkl"
-        self._texts: List[str] = []
-        self._metadatas: List[Dict[str, Any]] = []
-        self._bm25 = None
-
-    def _tokenize(self, text: str, use_stopwords: bool = True) -> List[str]:
-        import re
-        tokens = re.findall(r'[а-яёa-z0-9]+(?:[-_][а-яёa-z0-9]+)*', text.lower())
-        if BM25_USE_STOPWORDS and use_stopwords:
-            tokens = [t for t in tokens if t not in RUSSIAN_STOPWORDS and len(t) > 1]
-        return tokens
-
-    def build(self, texts: List[str], metadatas: List[Dict[str, Any]]) -> None:
+    def add_chunks(self, chunks) -> None:
+        """Добавить чанки в FTS-индекс (батчем для скорости)."""
+        rows = []
+        for c in chunks:
+            # Таблицы/формулы индексируем по full_content, если есть
+            text_for_index = c.full_content if c.full_content else c.content
+            tokenized = tokenize_ru(text_for_index)
+            if not tokenized:
+                continue
+            rows.append((
+                c.chunk_id,
+                tokenized,
+                c.chunk_type,
+                c.metadata.get("source", ""),
+                str(c.metadata.get("page", 0)),
+                c.metadata.get("heading", ""),
+                c.metadata.get("model", "unknown"),
+                json.dumps(c.metadata, ensure_ascii=False),
+            ))
+        if not rows:
+            return
         try:
-            from rank_bm25 import BM25Okapi
-            tokenized = [self._tokenize(t) for t in texts]
-            tokenized = [t if t else ["_empty_"] for t in tokenized]
-            self._texts = texts
-            self._metadatas = metadatas
-            self._bm25 = BM25Okapi(tokenized)
-        except ImportError:
-            logger.warning("rank_bm25 не установлен.")
+            with self.conn:
+                self.conn.executemany(
+                    "INSERT INTO chunks_fts "
+                    "(chunk_id, content, chunk_type, source, page, heading, model, metadata) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    rows,
+                )
+            logger.info(f"FTS5: добавлено {len(rows)} чанков")
+        except Exception as exc:
+            logger.warning(f"FTS5 add_chunks error: {exc}")
 
     def search(self, query: str, k: int = 10) -> List[Tuple[Dict[str, Any], float]]:
-        if self._bm25 is None:
+        """
+        Возвращает список (metadata_dict, score).
+        FTS5 bm25() возвращает отрицательные числа — инвертируем для единообразия.
+        """
+        fts_query = prepare_fts_query(query)
+        if not fts_query:
             return []
-        query_tokens = self._tokenize(query)
-        if not query_tokens:
-            return []
-        scores = self._bm25.get_scores(query_tokens)
-        indexed_scores = list(enumerate(scores))
-        indexed_scores.sort(key=lambda x: x[1], reverse=True)
-        return [(self._metadatas[idx], float(score))
-                for idx, score in indexed_scores[:k] if score > 0]
-
-    def save(self) -> None:
-        if self._bm25 is None:
-            return
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "texts": self._texts,
-            "metadatas": self._metadatas,
-            "bm25_corpus": getattr(self._bm25, 'corpus', None),
-        }
-        with open(self.path, 'wb') as f:
-            pickle.dump(data, f)
-
-    def load(self) -> bool:
-        if not self.path.exists():
-            return False
         try:
-            with open(self.path, 'rb') as f:
-                data = pickle.load(f)
-            self.build(data["texts"], data["metadatas"])
-            return True
+            cur = self.conn.cursor()
+            cur.execute(
+                """
+                SELECT chunk_id, content, chunk_type, source, page,
+                       heading, model, metadata, bm25(chunks_fts) AS rank
+                FROM chunks_fts
+                WHERE chunks_fts MATCH ?
+                ORDER BY rank
+                LIMIT ?
+                """,
+                (fts_query, k),
+            )
+            results = []
+            for row in cur.fetchall():
+                try:
+                    metadata = json.loads(row[7]) if row[7] else {}
+                except Exception:
+                    metadata = {}
+                # Нормализуем ключи (FTS хранит как строки)
+                metadata.setdefault("chunk_id", row[0])
+                metadata.setdefault("chunk_type", row[2])
+                metadata.setdefault("source", row[3])
+                metadata.setdefault("page", int(row[4]) if row[4] else 0)
+                metadata.setdefault("heading", row[5])
+                metadata.setdefault("model", row[6])
+                metadata.setdefault("content", row[1])
+                # bm25() < 0 → инвертируем, чтобы больше = лучше
+                score = -float(row[8]) if row[8] is not None else 0.0
+                results.append((metadata, score))
+            return results
         except Exception as exc:
-            logger.warning(f"Не удалось загрузить BM25: {exc}")
-            return False
+            logger.warning(f"FTS5 search error: {exc}")
+            return []
+
+    def count(self) -> int:
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM chunks_fts")
+        row = cur.fetchone()
+        return row[0] if row else 0
 
 
+# ═══════════════════════════════════════════════════════════════
+# IndexBuilder: собирает FAISS + FTS5 + DocStore
+# ═══════════════════════════════════════════════════════════════
 class IndexBuilder:
+    """
+    Построитель поисковых индексов.
+    - text_vectorstore:    FAISS для текстовых чанков
+    - summary_vectorstore: FAISS для сводок таблиц/формул/рисунков
+    - bm25:                SQLite FTS5 (sparse search, zero-RAM)
+    - docstore:            SQLite DocStore (full_content)
+    """
+
     def __init__(self, output_dir: Optional[Path] = None):
-        self.output_dir = output_dir or INDEX_DIR
+        self.output_dir = Path(output_dir) if output_dir else INDEX_DIR
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.text_index_path = self.output_dir / "text_index"
-        self.summary_index_path = self.output_dir / "summary_index"
-        self.docstore = SQLiteDocStore()
-        self.bm25 = BM25Index(self.output_dir / "bm25_index.pkl")
+
         self.text_vectorstore = None
         self.summary_vectorstore = None
+        self.bm25 = BM25FTSIndex(self.output_dir / "bm25_fts.db")
+        self.docstore = DocStore(DOCSTORE_DIR / "docstore.db")
 
-    def _get_embeddings(self):
-        return get_global_embeddings()
+        self._text_docs: List = []
+        self._summary_docs: List = []
 
-    def build(self, chunks: List[Chunk]) -> None:
-        from langchain_community.vectorstores import FAISS
-        ensure_dirs()
-        embeddings = self._get_embeddings()
+    def add_chunks(self, chunks) -> None:
+        """Добавить чанки во все индексы (батч-режим)."""
+        from langchain_core.documents import Document
 
-        text_docs, summary_docs = [], []
-        bm25_texts, bm25_metadatas = [], []
+        # 1. DocStore: сохраняем full_content для структурированных чанков
+        self.docstore.add_many(chunks)
 
-        for chunk in chunks:
-            bm25_text = chunk.content
-            if chunk.full_content:
-                bm25_text += "\n" + chunk.full_content
-            bm25_texts.append(bm25_text)
-            meta = chunk.metadata.copy()
-            meta["chunk_id"] = chunk.chunk_id
-            meta["chunk_type"] = chunk.chunk_type
-            meta["content"] = chunk.content
-            bm25_metadatas.append(meta)
+        # 2. FTS5: sparse-индекс
+        self.bm25.add_chunks(chunks)
 
-            if chunk.full_content is not None:
-                self.docstore.add(chunk.chunk_id, chunk.full_content, chunk.metadata)
-
-            doc = chunk.to_langchain_doc()
-            if EMBEDDING_PROVIDER == "local":
-                doc.page_content = PASSAGE_PREFIX + doc.page_content
-            if chunk.chunk_type == "text":
-                text_docs.append(doc)
+        # 3. Раскладываем по векторным базам
+        for c in chunks:
+            lc_doc = c.to_langchain_doc()
+            if c.chunk_type == "text":
+                self._text_docs.append(lc_doc)
             else:
-                summary_docs.append(doc)
+                # Для таблиц/формул индексируем эвристическую сводку
+                self._summary_docs.append(lc_doc)
 
-        if text_docs:
-            self.text_vectorstore = FAISS.from_documents(text_docs, embeddings)
-            self.text_vectorstore.save_local(str(self.text_index_path))
-        if summary_docs:
-            self.summary_vectorstore = FAISS.from_documents(summary_docs, embeddings)
-            self.summary_vectorstore.save_local(str(self.summary_index_path))
-        if bm25_texts:
-            self.bm25.build(bm25_texts, bm25_metadatas)
-            self.bm25.save()
+        # Периодическая сборка мусора при больших батчах
+        if len(self._text_docs) + len(self._summary_docs) > 2000:
+            self._flush_vectorstores()
 
+    def _flush_vectorstores(self) -> None:
+        """Собрать FAISS-индексы из накопленных документов."""
+        if not self._text_docs and not self._summary_docs:
+            return
+
+        embeddings = get_global_embeddings()
+
+        try:
+            from langchain_community.vectorstores import FAISS
+
+            if self._text_docs:
+                if self.text_vectorstore is None:
+                    self.text_vectorstore = FAISS.from_documents(
+                        self._text_docs, embeddings
+                    )
+                else:
+                    self.text_vectorstore.add_documents(self._text_docs)
+                self.text_vectorstore.save_local(
+                    str(self.output_dir), index_name="text_index"
+                )
+                logger.info(f"FAISS text: {len(self._text_docs)} docs added")
+                self._text_docs = []
+
+            if self._summary_docs:
+                if self.summary_vectorstore is None:
+                    self.summary_vectorstore = FAISS.from_documents(
+                        self._summary_docs, embeddings
+                    )
+                else:
+                    self.summary_vectorstore.add_documents(self._summary_docs)
+                self.summary_vectorstore.save_local(
+                    str(self.output_dir), index_name="summary_index"
+                )
+                logger.info(f"FAISS summary: {len(self._summary_docs)} docs added")
+                self._summary_docs = []
+        except Exception as exc:
+            logger.error(f"Ошибка сборки FAISS: {exc}")
+
+    def save(self) -> None:
+        """Финальная сборка и сохранение всех индексов."""
+        self._flush_vectorstores()
         logger.info(
-            f"Индексы построены: text={len(text_docs)}, "
-            f"summary={len(summary_docs)}, bm25={len(bm25_texts)}"
+            f"Индексы сохранены. FTS5 чанков: {self.bm25.count()}"
         )
 
-    def add_chunks(self, chunks: List[Chunk]) -> None:
-        from langchain_community.vectorstores import FAISS
-        embeddings = self._get_embeddings()
-        for chunk in chunks:
-            if chunk.full_content is not None:
-                self.docstore.add(chunk.chunk_id, chunk.full_content, chunk.metadata)
-            doc = chunk.to_langchain_doc()
-            if EMBEDDING_PROVIDER == "local":
-                doc.page_content = PASSAGE_PREFIX + doc.page_content
-            if chunk.chunk_type == "text":
-                if self.text_vectorstore is not None:
-                    self.text_vectorstore.add_documents([doc])
-                else:
-                    self.text_vectorstore = FAISS.from_documents([doc], embeddings)
-                self.text_vectorstore.save_local(str(self.text_index_path))
-            else:
-                if self.summary_vectorstore is not None:
-                    self.summary_vectorstore.add_documents([doc])
-                else:
-                    self.summary_vectorstore = FAISS.from_documents([doc], embeddings)
-                self.summary_vectorstore.save_local(str(self.summary_index_path))
-        # Перестраиваем BM25 (инкрементальное добавление не поддерживается)
-        all_texts = self.bm25._texts + [
-            c.content + ("\n" + c.full_content if c.full_content else "")
-            for c in chunks
-        ]
-        all_metas = self.bm25._metadatas + [
-            {**c.metadata, "chunk_id": c.chunk_id, "chunk_type": c.chunk_type,
-             "content": c.content}
-            for c in chunks
-        ]
-        self.bm25.build(all_texts, all_metas)
-        self.bm25.save()
+    def load(self) -> None:
+        """Загрузить существующие FAISS-индексы с диска."""
+        embeddings = get_global_embeddings()
+        try:
+            from langchain_community.vectorstores import FAISS
 
-    def load(self) -> bool:
-        from langchain_community.vectorstores import FAISS
-        embeddings = self._get_embeddings()
-        loaded = False
-        if self.text_index_path.exists():
-            try:
+            text_path = self.output_dir / "text_index.faiss"
+            if text_path.exists():
                 self.text_vectorstore = FAISS.load_local(
-                    str(self.text_index_path), embeddings,
-                    allow_dangerous_deserialization=True,
+                    str(self.output_dir), embeddings,
+                    index_name="text_index", allow_dangerous_deserialization=True,
                 )
-                loaded = True
-            except Exception as exc:
-                logger.warning(f"Ошибка загрузки text index: {exc}")
-        if self.summary_index_path.exists():
-            try:
+                logger.info("FAISS text_index загружен")
+
+            summary_path = self.output_dir / "summary_index.faiss"
+            if summary_path.exists():
                 self.summary_vectorstore = FAISS.load_local(
-                    str(self.summary_index_path), embeddings,
-                    allow_dangerous_deserialization=True,
+                    str(self.output_dir), embeddings,
+                    index_name="summary_index", allow_dangerous_deserialization=True,
                 )
-                loaded = True
-            except Exception as exc:
-                logger.warning(f"Ошибка загрузки summary index: {exc}")
-        self.bm25.load()
-        return loaded
+                logger.info("FAISS summary_index загружен")
+        except Exception as exc:
+            logger.warning(f"Ошибка загрузки FAISS: {exc}")
+
+        logger.info(f"FTS5 чанков в индексе: {self.bm25.count()}")

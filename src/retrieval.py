@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.6 — Модуль гибридного поиска
-★ ИСПРАВЛЕНО: убран шумный Query Expansion
-★ ДОБАВЛЕНО: семантическое кэширование через SQLite
-★ ВОЗВРАЩЕНО: ONNX-квантизация реранкера
+★ ИСПРАВЛЕНО: BM25 теперь работает через SQLite FTS5 (не ест RAM)
+★ Семантическое кэширование через SQLite
+★ ONNX-квантизация реранкера
 """
 import json
 import logging
@@ -12,6 +12,9 @@ import hashlib
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
+
 from .indexing import IndexBuilder, get_global_embeddings
 from config import (
     QUERY_PREFIX, PASSAGE_PREFIX,
@@ -25,11 +28,7 @@ logger = logging.getLogger("koib.retrieval")
 
 
 class SemanticCache:
-    """
-    ★ НОВОЕ: Семантическое кэширование.
-    Хранит (query_embedding, answer) в SQLite.
-    При совпадении (cosine > threshold) возвращает закэшированный ответ.
-    """
+    """Семантическое кэширование через SQLite."""
 
     def __init__(self, path: Optional[Path] = None,
                  threshold: float = SEMANTIC_CACHE_THRESHOLD):
@@ -57,7 +56,6 @@ class SemanticCache:
         if not SEMANTIC_CACHE_ENABLED or query_embedding is None:
             return None
         try:
-            import numpy as np
             cur = self.conn.cursor()
             cur.execute('SELECT query_text, embedding, answer, sources, query_hash FROM cache')
             q_vec = np.array(query_embedding, dtype=np.float32)
@@ -77,7 +75,6 @@ class SemanticCache:
                     best_match = (row, sim)
             if best_match and best_match[1] >= self.threshold:
                 row, sim = best_match
-                # Увеличиваем hit_count
                 self.conn.execute(
                     'UPDATE cache SET hit_count = hit_count + 1 WHERE query_hash = ?',
                     (row[4],)
@@ -98,7 +95,6 @@ class SemanticCache:
         if not SEMANTIC_CACHE_ENABLED or query_embedding is None:
             return
         try:
-            import numpy as np
             q_hash = hashlib.md5(query.lower().strip().encode()).hexdigest()
             emb_blob = np.array(query_embedding, dtype=np.float32).tobytes()
             with self.conn:
@@ -114,7 +110,7 @@ class SemanticCache:
 
 
 class ResponseCache:
-    """HyDE-кэш (для обратной совместимости)."""
+    """HyDE-кэш."""
 
     def __init__(self, path: Optional[Path] = None):
         self.path = path or METADATA_DIR / "response_cache.db"
@@ -214,15 +210,11 @@ class HybridRetriever:
         if not USE_RERANKER:
             return None
         try:
-            # ★ НОВОЕ: ONNX Runtime для квантизации
             if USE_ONNX_RERANKER:
                 try:
                     from sentence_transformers import CrossEncoder
-                    import onnxruntime as ort
                     self._reranker = CrossEncoder(
-                        RERANKER_MODEL,
-                        backend="onnx",
-                        # ONNX Runtime сам выбирает оптимальный execution provider
+                        RERANKER_MODEL, backend="onnx",
                     )
                     logger.info(f"ONNX реранкер загружен: {RERANKER_MODEL}")
                     return self._reranker
@@ -243,7 +235,6 @@ class HybridRetriever:
         model_filter: str = "",
         use_hyde: Optional[bool] = None,
     ) -> List[RetrievalResult]:
-        # ★ НОВОЕ: проверка семантического кэша
         query_embedding = None
         try:
             embeddings = get_global_embeddings()
@@ -257,8 +248,6 @@ class HybridRetriever:
         cached = self._semantic_cache.get(query, query_embedding)
         if cached:
             logger.info(f"Ответ из семантического кэша (sim={cached['similarity']:.3f})")
-            # Возвращаем пустой список результатов — ответ уже готов
-            # (используется AnswerGenerator для bypass-а генерации)
             return []
 
         intent = _detect_query_intent(query)
@@ -271,6 +260,7 @@ class HybridRetriever:
 
         vector_results = self._vector_search(search_query, intent, model_filter)
         bm25_results = self._bm25_search(query, model_filter)
+
         fused = self._reciprocal_rank_fusion(vector_results, bm25_results)
 
         try:
@@ -356,10 +346,10 @@ class HybridRetriever:
                     ))
             except Exception as exc:
                 logger.warning(f"Ошибка векторного поиска по сводкам: {exc}")
-
         return results
 
     def _bm25_search(self, query: str, model_filter: str = "") -> List[RetrievalResult]:
+        """Sparse-поиск через SQLite FTS5 (не требует RAM)."""
         results: List[RetrievalResult] = []
         bm25_hits = self.index_builder.bm25.search(query, k=BM25_SEARCH_K)
         for metadata, score in bm25_hits:

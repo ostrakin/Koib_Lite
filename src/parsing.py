@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
 """
 Koib-V-4.6 — Модуль парсинга документов
-★ ИСПРАВЛЕНО: _extract_tables_from_page не требует pandas (используем tabulate)
-★ ИСПРАВЛЕНО: current_heading пробрасывается в метаданные всех элементов
+★ ИСПРАВЛЕНО: явный вызов gc.collect() после каждой страницы — защита от OOM
+★ ИСПРАВЛЕНО: явное удаление pixmap и изображений
 """
 import io
 import re
+import gc
 import hashlib
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field, asdict
+
 import fitz
 from docx import Document as DocxDocument
 from PIL import Image
+
 from .utils import (
     clean_text, text_hash, detect_model_in_text,
     detect_model_from_filename, find_figure_caption,
@@ -70,7 +73,9 @@ def _is_scanned_page(page: fitz.Page, min_chars: int = OCR_MIN_TEXT_CHARS) -> bo
                 continue
             img = Image.open(io.BytesIO(base_image["image"]))
             if img.width * img.height / page_area > 0.8:
+                img.close()
                 return True
+            img.close()
         except Exception:
             continue
     return True
@@ -92,10 +97,6 @@ def _ocr_image(image_pil: Image.Image, lang: str = "rus+eng") -> str:
 
 
 def _extract_tables_from_page(page: fitz.Page) -> List[Dict[str, Any]]:
-    """
-    ★ ИСПРАВЛЕНО: не требует pandas.
-    Использует tab.to_markdown() (доступно в PyMuPDF>=1.23.0).
-    """
     tables = []
     try:
         tab_finder = page.find_tables()
@@ -104,7 +105,6 @@ def _extract_tables_from_page(page: fitz.Page) -> List[Dict[str, Any]]:
                 rows = tab.extract()
                 if not rows or len(rows) < 2:
                     continue
-                # Формируем Markdown вручную (без pandas)
                 md_lines = []
                 num_cols = max(len(r) for r in rows) if rows else 0
                 for i, row in enumerate(rows):
@@ -170,6 +170,7 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
     filename = file_path.name
     model = model_hint or detect_model_from_filename(filename)
     elements: List[DocumentElement] = []
+
     try:
         doc = fitz.open(str(file_path))
     except Exception as exc:
@@ -185,27 +186,31 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
     if confidence > 0.3:
         model = detected_model
 
-    # ★ ИСПРАВЛЕНО: current_heading пробрасывается в метаданные всех элементов
     current_heading = ""
-
     for page_num in range(len(doc)):
         page = doc[page_num]
         page_text = page.get_text("text").strip()
 
+        # ★ ИСПРАВЛЕНО: OCR с контролируемым жизненным циклом объектов
         if _is_scanned_page(page):
             pix = page.get_pixmap(dpi=OCR_DPI)
-            img = Image.open(io.BytesIO(pix.tobytes("png")))
-            ocr_text = _ocr_image(img)
-            if ocr_text:
-                elements.append(DocumentElement(
-                    content=ocr_text, element_type="text",
-                    source=filename, page=page_num + 1, model=model,
-                    heading=current_heading,
-                    metadata={"ocr": True},
-                ))
+            try:
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                ocr_text = _ocr_image(img)
+                if ocr_text:
+                    elements.append(DocumentElement(
+                        content=ocr_text, element_type="text",
+                        source=filename, page=page_num + 1, model=model,
+                        heading=current_heading,
+                        metadata={"ocr": True},
+                    ))
+                img.close()
+            finally:
+                # ★ КРИТИЧНО: немедленное освобождение битмапа (~15-25 МБ)
+                del pix
+                gc.collect()
             continue
 
-        # Извлекаем заголовки — обновляем current_heading
         headings = extract_headings(page_text)
         if headings:
             current_heading = headings[0]
@@ -238,6 +243,7 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
 
         images = page.get_images(full=True)
         for img_idx, img_info in enumerate(images):
+            img = None
             try:
                 xref = img_info[0]
                 base_image = doc.extract_image(xref)
@@ -263,6 +269,12 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                 ))
             except Exception as exc:
                 logger.debug(f"Ошибка изображения: {exc}")
+            finally:
+                if img is not None:
+                    try:
+                        img.close()
+                    except Exception:
+                        pass
 
         if page_text:
             for heading in headings:
@@ -281,7 +293,12 @@ def parse_pdf(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                     heading=current_heading,
                 ))
 
+        # ★ ИСПРАВЛЕНО: принудительная сборка мусора после каждой страницы
+        gc.collect()
+
     doc.close()
+    # ★ Финальная очистка после всего документа
+    gc.collect()
     logger.info(f"Извлечено {len(elements)} элементов из {filename}")
     return elements
 
@@ -293,6 +310,7 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
     filename = file_path.name
     model = model_hint or detect_model_from_filename(filename)
     elements: List[DocumentElement] = []
+
     try:
         doc = DocxDocument(str(file_path))
     except Exception as exc:
@@ -359,6 +377,8 @@ def parse_docx(file_path: Path, model_hint: str = "") -> List[DocumentElement]:
                 model=detected_model if conf > 0.3 else model,
                 heading=current_heading,
             ))
+
+    gc.collect()
     logger.info(f"Извлечено {len(elements)} элементов из {filename}")
     return elements
 
