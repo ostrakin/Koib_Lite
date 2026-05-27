@@ -2,9 +2,7 @@
 """
 Koib-V-4.6 — Модуль гибридного поиска
 ★ ИСПРАВЛЕНО: BM25 теперь работает через SQLite FTS5 (не ест RAM)
-★ Семантическое кэширование через SQLite
-★ ONNX-квантизация реранкера
-★ ДОБАВЛЕНО: методы clear() в ResponseCache и SemanticCache
+★ ИСПРАВЛЕНО: SemanticCache.get() использует LIMIT для защиты от OOM
 """
 import json
 import logging
@@ -26,13 +24,8 @@ from config import (
 
 logger = logging.getLogger("koib.retrieval")
 
-
-# ═══════════════════════════════════════════════════════════════
-# Семантическое кэширование (SQLite)
-# ═══════════════════════════════════════════════════════════════
 class SemanticCache:
     """Семантическое кэширование через SQLite."""
-
     def __init__(self, path: Optional[Path] = None,
                  threshold: float = SEMANTIC_CACHE_THRESHOLD):
         self.path = path or METADATA_DIR / "semantic_cache.db"
@@ -60,11 +53,18 @@ class SemanticCache:
             return None
         try:
             cur = self.conn.cursor()
-            cur.execute('SELECT query_text, embedding, answer, sources, query_hash FROM cache')
+            # ★ ИСПРАВЛЕНО: LRU-ограничение. Читаем только топ-1000 горячих/свежих записей.
+            cur.execute('''
+                SELECT query_text, embedding, answer, sources, query_hash 
+                FROM cache 
+                ORDER BY hit_count DESC, created_at DESC 
+                LIMIT 1000
+            ''')
             q_vec = np.array(query_embedding, dtype=np.float32)
             q_norm = np.linalg.norm(q_vec)
             if q_norm == 0:
                 return None
+                
             best_match = None
             best_sim = 0.0
             for row in cur.fetchall():
@@ -76,6 +76,7 @@ class SemanticCache:
                 if sim > best_sim:
                     best_sim = sim
                     best_match = (row, sim)
+                    
             if best_match and best_match[1] >= self.threshold:
                 row, sim = best_match
                 self.conn.execute(
@@ -112,42 +113,28 @@ class SemanticCache:
             logger.debug(f"Semantic cache set error: {exc}")
 
     def clear(self) -> None:
-        """Полностью очистить семантический кэш."""
         try:
             with self.conn:
                 self.conn.execute('DELETE FROM cache')
-            logger.info("Semantic cache очищен")
         except Exception as exc:
             logger.debug(f"Semantic cache clear error: {exc}")
 
     def purge_stale(self, days: int = 30, min_hits: int = 1) -> int:
-        """
-        Удалить старые записи с низким hit_count (ротация кэша).
-        Возвращает количество удалённых записей.
-        """
         try:
             with self.conn:
                 cur = self.conn.execute(
-                    '''DELETE FROM cache
-                       WHERE hit_count <= ?
-                         AND julianday('now') - julianday(created_at) > ?''',
+                    '''DELETE FROM cache 
+                       WHERE hit_count <= ? 
+                       AND julianday('now') - julianday(created_at) > ?''',
                     (min_hits, days),
                 )
-                deleted = cur.rowcount
-            if deleted:
-                logger.info(f"Semantic cache: удалено {deleted} устаревших записей")
-            return deleted
+                return cur.rowcount
         except Exception as exc:
             logger.debug(f"Semantic cache purge error: {exc}")
-            return 0
+        return 0
 
-
-# ═══════════════════════════════════════════════════════════════
-# HyDE-кэш (SQLite)
-# ═══════════════════════════════════════════════════════════════
 class ResponseCache:
     """HyDE-кэш."""
-
     def __init__(self, path: Optional[Path] = None):
         self.path = path or METADATA_DIR / "response_cache.db"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,17 +166,12 @@ class ResponseCache:
             )
 
     def clear(self) -> None:
-        """Полностью очистить HyDE-кэш."""
         try:
             with self.conn:
                 self.conn.execute('DELETE FROM cache')
         except Exception as exc:
             logger.debug(f"ResponseCache clear error: {exc}")
 
-
-# ═══════════════════════════════════════════════════════════════
-# Структура результата поиска
-# ═══════════════════════════════════════════════════════════════
 @dataclass
 class RetrievalResult:
     chunk_id: str
@@ -222,14 +204,9 @@ class RetrievalResult:
             parts.append(display_content)
         return "\n".join(parts)
 
-
-# ═══════════════════════════════════════════════════════════════
-# Определение интента запроса
-# ═══════════════════════════════════════════════════════════════
 TABLE_KEYWORDS = {"таблиц", "значени", "параметр", "сводк", "данные", "показател"}
 FORMULA_KEYWORDS = {"формул", "вычислен", "расчёт", "уравнен", "коэффициент"}
 FIGURE_KEYWORDS = {"схем", "рисунок", "диаграмм", "чертёж", "график"}
-
 
 def _detect_query_intent(query: str) -> Dict[str, float]:
     query_lower = query.lower()
@@ -245,10 +222,6 @@ def _detect_query_intent(query: str) -> Dict[str, float]:
         intent["text"] = max(0.3, 1.0 - total_hits * 0.2)
     return intent
 
-
-# ═══════════════════════════════════════════════════════════════
-# Гибридный ретривер (Dense + Sparse + Reranker)
-# ═══════════════════════════════════════════════════════════════
 class HybridRetriever:
     def __init__(self, index_builder: Optional[IndexBuilder] = None):
         self.index_builder = index_builder or IndexBuilder()
@@ -266,28 +239,19 @@ class HybridRetriever:
             if USE_ONNX_RERANKER:
                 try:
                     from sentence_transformers import CrossEncoder
-                    self._reranker = CrossEncoder(
-                        RERANKER_MODEL, backend="onnx",
-                    )
-                    logger.info(f"ONNX реранкер загружен: {RERANKER_MODEL}")
+                    self._reranker = CrossEncoder(RERANKER_MODEL, backend="onnx")
                     return self._reranker
                 except Exception as onnx_exc:
                     logger.warning(f"ONNX fallback: {onnx_exc}")
             from sentence_transformers import CrossEncoder
             self._reranker = CrossEncoder(RERANKER_MODEL)
-            logger.info(f"Реранкер загружен: {RERANKER_MODEL}")
             return self._reranker
         except Exception as exc:
             logger.warning(f"Не удалось загрузить реранжер: {exc}")
             return None
 
-    def search(
-        self,
-        query: str,
-        k: int = FINAL_TOP_K,
-        model_filter: str = "",
-        use_hyde: Optional[bool] = None,
-    ) -> List[RetrievalResult]:
+    def search(self, query: str, k: int = FINAL_TOP_K,
+               model_filter: str = "", use_hyde: Optional[bool] = None) -> List[RetrievalResult]:
         query_embedding = None
         try:
             embeddings = get_global_embeddings()
@@ -343,27 +307,18 @@ class HybridRetriever:
         if self.index_builder.text_vectorstore is not None:
             try:
                 k_text = int(VECTOR_SEARCH_K * intent.get("text", 1.0)) + 3
-                docs = self.index_builder.text_vectorstore.similarity_search_with_score(
-                    search_text, k=k_text,
-                )
+                docs = self.index_builder.text_vectorstore.similarity_search_with_score(search_text, k=k_text)
                 for doc, score in docs:
                     chunk_id = doc.metadata.get("chunk_id", "")
-                    if chunk_id in seen_ids:
-                        continue
+                    if chunk_id in seen_ids: continue
                     seen_ids.add(chunk_id)
                     doc_model = doc.metadata.get("model", "unknown")
-                    if model_filter and doc_model != "unknown" and doc_model != model_filter:
-                        continue
+                    if model_filter and doc_model != "unknown" and doc_model != model_filter: continue
                     results.append(RetrievalResult(
-                        chunk_id=chunk_id,
-                        content=doc.page_content,
-                        score=float(score),
-                        source=doc.metadata.get("source", ""),
-                        page=doc.metadata.get("page", 0),
-                        heading=doc.metadata.get("heading", ""),
-                        model=doc_model,
-                        chunk_type=doc.metadata.get("chunk_type", "text"),
-                        metadata=doc.metadata,
+                        chunk_id=chunk_id, content=doc.page_content, score=float(score),
+                        source=doc.metadata.get("source", ""), page=doc.metadata.get("page", 0),
+                        heading=doc.metadata.get("heading", ""), model=doc_model,
+                        chunk_type=doc.metadata.get("chunk_type", "text"), metadata=doc.metadata,
                     ))
             except Exception as exc:
                 logger.warning(f"Ошибка векторного поиска по текстам: {exc}")
@@ -371,62 +326,42 @@ class HybridRetriever:
         if self.index_builder.summary_vectorstore is not None:
             try:
                 k_struct = int(VECTOR_SEARCH_K * max(intent["table"], intent["formula"], 0.3)) + 3
-                docs = self.index_builder.summary_vectorstore.similarity_search_with_score(
-                    search_text, k=k_struct,
-                )
+                docs = self.index_builder.summary_vectorstore.similarity_search_with_score(search_text, k=k_struct)
                 for doc, score in docs:
                     chunk_id = doc.metadata.get("chunk_id", "")
-                    if chunk_id in seen_ids:
-                        continue
+                    if chunk_id in seen_ids: continue
                     seen_ids.add(chunk_id)
                     doc_model = doc.metadata.get("model", "unknown")
-                    if model_filter and doc_model != "unknown" and doc_model != model_filter:
-                        continue
+                    if model_filter and doc_model != "unknown" and doc_model != model_filter: continue
                     real_chunk_type = doc.metadata.get("chunk_type", "text")
                     if real_chunk_type not in ("table", "formula", "figure"):
                         real_chunk_type = "text"
                     results.append(RetrievalResult(
-                        chunk_id=chunk_id,
-                        content=doc.page_content,
-                        score=float(score),
-                        source=doc.metadata.get("source", ""),
-                        page=doc.metadata.get("page", 0),
-                        heading=doc.metadata.get("heading", ""),
-                        model=doc_model,
-                        chunk_type=real_chunk_type,
-                        metadata=doc.metadata,
+                        chunk_id=chunk_id, content=doc.page_content, score=float(score),
+                        source=doc.metadata.get("source", ""), page=doc.metadata.get("page", 0),
+                        heading=doc.metadata.get("heading", ""), model=doc_model,
+                        chunk_type=real_chunk_type, metadata=doc.metadata,
                     ))
             except Exception as exc:
                 logger.warning(f"Ошибка векторного поиска по сводкам: {exc}")
         return results
 
     def _bm25_search(self, query: str, model_filter: str = "") -> List[RetrievalResult]:
-        """Sparse-поиск через SQLite FTS5 (не требует RAM)."""
         results: List[RetrievalResult] = []
         bm25_hits = self.index_builder.bm25.search(query, k=BM25_SEARCH_K)
         for metadata, score in bm25_hits:
             doc_model = metadata.get("model", "unknown")
-            if model_filter and doc_model != "unknown" and doc_model != model_filter:
-                continue
+            if model_filter and doc_model != "unknown" and doc_model != model_filter: continue
             results.append(RetrievalResult(
-                chunk_id=metadata.get("chunk_id", ""),
-                content=metadata.get("content", ""),
-                score=score,
-                source=metadata.get("source", ""),
-                page=metadata.get("page", 0),
-                heading=metadata.get("heading", ""),
-                model=doc_model,
-                chunk_type=metadata.get("chunk_type", "text"),
-                metadata=metadata,
+                chunk_id=metadata.get("chunk_id", ""), content=metadata.get("content", ""),
+                score=score, source=metadata.get("source", ""), page=metadata.get("page", 0),
+                heading=metadata.get("heading", ""), model=doc_model,
+                chunk_type=metadata.get("chunk_type", "text"), metadata=metadata,
             ))
         return results
 
-    def _reciprocal_rank_fusion(
-        self,
-        vector_results: List[RetrievalResult],
-        bm25_results: List[RetrievalResult],
-        k_rrf: int = 60,
-    ) -> List[RetrievalResult]:
+    def _reciprocal_rank_fusion(self, vector_results: List[RetrievalResult],
+                                bm25_results: List[RetrievalResult], k_rrf: int = 60) -> List[RetrievalResult]:
         chunk_scores: Dict[str, float] = {}
         chunk_map: Dict[str, RetrievalResult] = {}
         for rank, r in enumerate(vector_results, 1):
@@ -437,8 +372,8 @@ class HybridRetriever:
             chunk_scores.setdefault(r.chunk_id, 0.0)
             chunk_map[r.chunk_id] = r
             chunk_scores[r.chunk_id] += (1 - HYBRID_ALPHA) / (k_rrf + rank)
-        sorted_ids = sorted(chunk_scores.keys(),
-                            key=lambda x: chunk_scores[x], reverse=True)
+            
+        sorted_ids = sorted(chunk_scores.keys(), key=lambda x: chunk_scores[x], reverse=True)
         results = []
         for cid in sorted_ids:
             r = chunk_map[cid]
@@ -446,8 +381,7 @@ class HybridRetriever:
             results.append(r)
         return results
 
-    def _rerank(self, query: str, results: List[RetrievalResult],
-                reranker) -> List[RetrievalResult]:
+    def _rerank(self, query: str, results: List[RetrievalResult], reranker) -> List[RetrievalResult]:
         try:
             pairs = [(query, r.content) for r in results]
             scores = reranker.predict(pairs)
@@ -461,15 +395,13 @@ class HybridRetriever:
 
     def _apply_hyde(self, query: str) -> Optional[str]:
         cached = self._cache.get(query)
-        if cached:
-            return cached
+        if cached: return cached
         try:
             from .generation import LLMClient
             client = LLMClient()
             hypothetical = client.generate(
                 f"Ответь кратко на вопрос, как если бы ты был экспертом "
-                f"по технической документации:\n{query}",
-                max_tokens=300,
+                f"по технической документации:\n{query}", max_tokens=300,
             )
             if hypothetical and len(hypothetical) > 20:
                 self._cache.set(query, hypothetical)
